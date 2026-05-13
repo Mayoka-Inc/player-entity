@@ -32,6 +32,14 @@ export class Player {
         this.dashTimer = 0;
         this.dashCooldown = 0;
         this.dashDirection = new THREE.Vector2();
+
+        // Physics Banking & Elastic Inertia state
+        this.logicPosition = new THREE.Vector2(0, 0);
+        this.velocity = new THREE.Vector2(0, 0);
+        this.lastVelocity = new THREE.Vector2(0, 0);
+        this.springVelocity = new THREE.Vector2(0, 0);
+        this.gForce = 0;
+        this.bankAngle = 0;
     }
 
     /**
@@ -72,11 +80,12 @@ export class Player {
         if (this.dashCooldown > 0) this.dashCooldown--;
 
         let currentMoveSpeed = 0.15;
+        const lastLogicPos = this.logicPosition.clone();
         
         if (this.isDashing) {
             currentMoveSpeed = 0.8;
-            this.mesh.position.x += this.dashDirection.x * currentMoveSpeed;
-            this.mesh.position.y += this.dashDirection.y * currentMoveSpeed;
+            this.logicPosition.x += this.dashDirection.x * currentMoveSpeed;
+            this.logicPosition.y += this.dashDirection.y * currentMoveSpeed;
             this.dashTimer--;
             
             if (this.dashTimer <= 0) {
@@ -86,33 +95,54 @@ export class Player {
         } else {
             // Horizontal movement
             if (inputHandler.isPressed('a') || inputHandler.isPressed('ArrowLeft')) {
-                this.mesh.position.x -= currentMoveSpeed;
+                this.logicPosition.x -= currentMoveSpeed;
             }
             if (inputHandler.isPressed('d') || inputHandler.isPressed('ArrowRight')) {
-                this.mesh.position.x += currentMoveSpeed;
+                this.logicPosition.x += currentMoveSpeed;
             }
             
             // Vertical movement
             if (inputHandler.isPressed('w') || inputHandler.isPressed('ArrowUp')) {
-                this.mesh.position.y += currentMoveSpeed;
+                this.logicPosition.y += currentMoveSpeed;
             }
             if (inputHandler.isPressed('s') || inputHandler.isPressed('ArrowDown')) {
-                this.mesh.position.y -= currentMoveSpeed;
+                this.logicPosition.y -= currentMoveSpeed;
             }
         }
 
         // Radial constraint
         const radiusConstraint = 9.5;
-        const dist = Math.sqrt(this.mesh.position.x ** 2 + this.mesh.position.y ** 2);
+        const dist = this.logicPosition.length();
         
         if (dist > radiusConstraint) {
-            const angle = Math.atan2(this.mesh.position.y, this.mesh.position.x);
-            this.mesh.position.x = Math.cos(angle) * radiusConstraint;
-            this.mesh.position.y = Math.sin(angle) * radiusConstraint;
+            this.logicPosition.setLength(radiusConstraint);
         }
 
+        // Physics: Elastic Inertia (Spring overshoot)
+        const stiffness = 0.25;
+        const damping = 0.75;
+        
+        const displacement = new THREE.Vector2().subVectors(this.logicPosition, this.mesh.position);
+        const force = displacement.multiplyScalar(stiffness);
+        this.springVelocity.add(force);
+        this.springVelocity.multiplyScalar(damping);
+        
+        this.mesh.position.x += this.springVelocity.x;
+        this.mesh.position.y += this.springVelocity.y;
+
+        // Physics: Banking & G-Force
+        this.velocity.subVectors(this.logicPosition, lastLogicPos);
+        const acceleration = this.velocity.length() - this.lastVelocity.length();
+        this.gForce = Math.abs(acceleration) * 5.0 + (this.isDashing ? 1.5 : 0);
+        this.lastVelocity.copy(this.velocity);
+
+        // Banking (Roll) based on horizontal velocity
+        const targetBank = -this.velocity.x * 4.0;
+        this.bankAngle = THREE.MathUtils.lerp(this.bankAngle, targetBank, 0.15);
+        this.mesh.rotation.z = this.bankAngle;
+
         // Engine Glow Pulse
-        const glowPulse = 1.5 + Math.sin(Date.now() * 0.01 * speed) * 0.5;
+        const glowPulse = (1.5 + Math.sin(Date.now() * 0.01 * speed) * 0.5) * (1 + this.gForce * 0.5);
         this.material.emissiveIntensity = glowPulse;
 
         // Hit Animations (Flash/Jitter/Dash)
@@ -143,10 +173,17 @@ export class Player {
     }
 
     _updateTrail() {
+        // Dynamic properties based on G-force (velocity changes)
+        const trailScale = 1.0 + this.gForce * 2.0;
+        const trailColor = new THREE.Color(0x00ffff);
+        if (this.gForce > 0.1) {
+            trailColor.lerp(new THREE.Color(0xff00ff), Math.min(this.gForce, 1.0));
+        }
+
         // Add new particle
         const particleGeom = new THREE.SphereGeometry(0.05, 4, 4);
         const particleMat = new THREE.MeshBasicMaterial({
-            color: 0x00ffff,
+            color: trailColor,
             transparent: true,
             opacity: 0.8
         });
@@ -156,7 +193,8 @@ export class Player {
         
         this.trailParticles.push({
             mesh: particle,
-            life: 1.0
+            life: 1.0,
+            maxScale: trailScale
         });
         this.trailGroup.add(particle);
 
@@ -164,8 +202,9 @@ export class Player {
         for (let i = this.trailParticles.length - 1; i >= 0; i--) {
             const p = this.trailParticles[i];
             p.life -= 0.05;
-            p.mesh.scale.set(p.life, p.life, p.life);
-            p.mesh.material.opacity = p.life;
+            const currentScale = p.life * p.maxScale;
+            p.mesh.scale.set(currentScale, currentScale, currentScale);
+            p.mesh.material.opacity = p.life * 0.8;
             
             if (p.life <= 0) {
                 this.trailGroup.remove(p.mesh);
